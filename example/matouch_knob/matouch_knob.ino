@@ -1,86 +1,121 @@
-FFFF// Use 2.3.2  Version Simple_FOC               
-// Use 2.0.0  Version SPI                      
-// Use 2.0.0  Version Wire                     
-// Use 2.0.0  Version EEPROM                   
-// Use 8.3.11 Version lvgl                     
-// Use 1.3.1  Version GFX_Library_for_Arduino  
-// Use 2.0.0  Version BLE                      
-// Use 2.5.0  Version OneButton                
-// Use 2.0.0  Version USB                      
-// Use 2.0.0  Version WiFi                     
-// Use 1.1.4  Version AsyncTCP                 
-// Use 1.2.7  Version ESPAsyncWebSrv           
-// Use 2.0.0  Version FS                       
-// Use 2.0.0  Version ESPmDNS                  
-// Use 7.0.4  Version ArduinoJson              
-// Use 2.0.0  Version Preferences              
-// Use 2.0.0  Version Update                   
-// Use 2.0.0  Version FFat                       
-// Use 2.0.0  Version SPIFFS     
-// xxxPriam                
-
-
-#include "motor_task.h"
-#include "display_task.h"
+#include <SimpleFOC.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <USB.h>
+#include <USBHID.h>
 #include "interface.h"
 
-TaskHandle_t xTask1;
-TaskHandle_t xTask2;
-TaskHandle_t xTask3;
-// static MotorTask motor_task = MotorTask();
-void setup()
-{
-  // monitoring port
-  Serial.begin(115200);
-  delay(100);
-  ffat_init();
-  if (!EEPROM.begin(1000))
-  {
-    Serial.println("Failed to initialise EEPROM");
-    Serial.println("Restarting...");
-    delay(1000);
-    ESP.restart();
-  }
+// Define SPI pins for MT6701
+#define MT6701_SDA 1
+#define MT6701_SCL 2
+#define MT6701_SS 42
 
-  pthread_mutex_init(&lvgl_mutex, NULL);
-  /* 创建队列，其大小可包含5个元素Data */
-  queue_ = xQueueCreate(5, sizeof(Command));
-  assert(queue_ != NULL);
-  knob_state_queue_ = xQueueCreate(1, sizeof(KnobState));
-  assert(knob_state_queue_ != NULL);
-  xTaskCreatePinnedToCore(
-      interface_run,
-      "interface_run",
-      8192,
-      NULL,
-      2,
-      &xTask3,
-      1);
-  xTaskCreatePinnedToCore(
-      motor_run,
-      "motor_task", /* 任务名称. */
-      8192,         /* 任务的堆栈大小 */
-      NULL,         /* 任务的参数 */
-      1,            /* 任务的优先级 */
-      &xTask1,      /* 跟踪创建的任务的任务句柄 */
-      1);           /* pin任务到核心0 */
+// SPI Sensor Initialization
+SPIClass *hspi = nullptr;
+GenericSensor sensor(
+    []() -> float {
+      hspi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+      digitalWrite(hspi->pinSS(), LOW);
+      uint16_t ag = hspi->transfer16(0);
+      digitalWrite(hspi->pinSS(), HIGH);
+      hspi->endTransaction();
+      ag = ag >> 2;
+      float rad = (float)ag * 2 * PI / 16384;
+      return (rad < 0) ? rad + 2 * PI : rad;
+    },
+    []() {
+      hspi = new SPIClass(HSPI);
+      hspi->begin(MT6701_SCL, MT6701_SDA, -1, MT6701_SS);
+      pinMode(hspi->pinSS(), OUTPUT);
+    });
 
-  display_init();
-  xTaskCreatePinnedToCore(
-      display_run,
-      "display_run",
-      20000,
-      NULL,
-      0,
-      &xTask2,
-      0);
+// Motor setup
+BLDCMotor motor = BLDCMotor(7);
+BLDCDriver3PWM driver = BLDCDriver3PWM(17, 16, 15);
 
-  vTaskDelete(NULL);
+// Knob Configuration
+struct KnobConfig {
+  int32_t num_positions;
+  int32_t position;
+  float position_width_radians;
+  float detent_strength_unit;
+  float endstop_strength_unit;
+  float snap_point;
+};
+KnobConfig config = {
+    .num_positions = 0,
+    .position = 0,
+    .position_width_radians = 1 * _PI / 180,
+    .detent_strength_unit = 1,
+    .endstop_strength_unit = 1,
+    .snap_point = 1.1,
+};
+
+float current_detent_center = 0.0;
+
+// Initialize FOC
+void initFOC() {
+  sensor.init();
+  motor.linkSensor(&sensor);
+
+  driver.voltage_power_supply = 5;
+  driver.pwm_frequency = 50000;
+  driver.init();
+  motor.linkDriver(&driver);
+
+  motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
+  motor.controller = MotionControlType::torque;
+
+  motor.PID_velocity.P = 2;
+  motor.PID_velocity.I = 0;
+  motor.PID_velocity.D = 0.08;
+  motor.PID_velocity.output_ramp = 10000;
+  motor.PID_velocity.limit = 10;
+
+  motor.voltage_limit = 5;
+  motor.LPF_velocity.Tf = 0.01;
+  motor.velocity_limit = 40;
+
+  motor.init();
+  motor.initFOC();
+
+  current_detent_center = motor.shaft_angle;
+  Serial.println("Motor ready.");
 }
 
-void loop()
-{
-  // lv_timer_handler(); /* let the GUI do its work */
-  // vTaskDelay(0);
-  // motor_run();
+// Main motor loop
+void motorLoop() {
+  float angle_to_detent_center = motor.shaft_angle - current_detent_center;
+
+  if (angle_to_detent_center > config.position_width_radians * config.snap_point) {
+    current_detent_center += config.position_width_radians;
+    angle_to_detent_center -= config.position_width_radians;
+    config.position--;
+  } else if (angle_to_detent_center < -config.position_width_radians * config.snap_point) {
+    current_detent_center -= config.position_width_radians;
+    angle_to_detent_center += config.position_width_radians;
+    config.position++;
+  }
+
+  float dead_zone_adjustment = constrain(
+      angle_to_detent_center,
+      -config.position_width_radians * 0.2,
+      config.position_width_radians * 0.2);
+
+  motor.PID_velocity.P = config.detent_strength_unit * 4;
+  float torque = motor.PID_velocity(-angle_to_detent_center + dead_zone_adjustment);
+  motor.move(torque);
+  motor.loopFOC();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  initFOC();
+
+  Serial.println("Motor and HID ready.");
+}
+
+void loop() {
+  motorLoop();
 }
