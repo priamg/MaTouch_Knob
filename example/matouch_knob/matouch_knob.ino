@@ -43,10 +43,10 @@ struct KnobConfig {
   float snap_point;
 };
 KnobConfig config = {
-    .num_positions = 0,
+    .num_positions = 2, // Two detents per revolution
     .position = 0,
-    .position_width_radians = 1 * _PI / 180,
-    .detent_strength_unit = 1,
+    .position_width_radians = PI, // 180 degrees per detent
+    .detent_strength_unit = 10, // Strong detent force
     .endstop_strength_unit = 1,
     .snap_point = 1.1,
 };
@@ -66,15 +66,15 @@ void initFOC() {
   motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
   motor.controller = MotionControlType::torque;
 
-  motor.PID_velocity.P = 2;
-  motor.PID_velocity.I = 0;
-  motor.PID_velocity.D = 0.08;
+  motor.PID_velocity.P = 4.0; // Increased P for stronger response
+  motor.PID_velocity.I = 0.1; // Small integral for smoother response
+  motor.PID_velocity.D = 0.1; // Increased D for damping oscillations
   motor.PID_velocity.output_ramp = 10000;
   motor.PID_velocity.limit = 10;
 
-  motor.voltage_limit = 5;
+  motor.voltage_limit = 6; // Increased voltage limit for stronger torque
   motor.LPF_velocity.Tf = 0.01;
-  motor.velocity_limit = 40;
+  motor.velocity_limit = 50;
 
   motor.init();
   motor.initFOC();
@@ -102,7 +102,7 @@ void motorLoop() {
       -config.position_width_radians * 0.2,
       config.position_width_radians * 0.2);
 
-  motor.PID_velocity.P = config.detent_strength_unit * 4;
+  motor.PID_velocity.P = config.detent_strength_unit * 4; // Emphasize detent strength
   float torque = motor.PID_velocity(-angle_to_detent_center + dead_zone_adjustment);
   motor.move(torque);
   motor.loopFOC();
